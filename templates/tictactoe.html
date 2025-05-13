@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Flask Multiplayer Game</title>
+  <script src="https://cdn.socket.io/4.3.2/socket.io.min.js"></script>
+  <style>
+    .board { display: grid; grid-template-columns: repeat(3, 60px); gap: 5px; }
+    .cell { width: 60px; height: 60px; font-size: 24px; text-align: center; line-height: 60px; background: #eee; }
+  </style>
+</head>
+<body>
+  <h1>Multiplayer Game</h1>
+  <div class="board" id="board"></div>
+
+  <script>
+    const socket = io();
+    const board = document.getElementById('board');
+
+    for (let i = 0; i < 9; i++) {
+      const cell = document.createElement('div');
+      cell.classList.add('cell');
+      cell.dataset.id = i;
+      cell.onclick = () => socket.emit('make_move', { cell: i });
+      board.appendChild(cell);
+    }
+
+    socket.on('state_update', (state) => {
+      for (let i = 0; i < 9; i++) {
+        board.children[i].textContent = state.cells[i];
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>The Dark Forest</title>
+<script src="https://cdn.socket.io/4.3.2/socket.io.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500&display=swap" rel="stylesheet">
+<style>
+:root{--sz:10px}
+body{font-family:'Orbitron',sans-serif;background:#000;color:#fff;margin:0;text-align:center}
+
+#controls{padding:6px;background:rgba(0,0,0,.85);display:flex;gap:10px;justify-content:center;align-items:center;font-size:16px;flex-wrap:wrap}
+#bars{display:flex;gap:6px}
+.barWrap{width:120px;background:#333;height:8px}
+.bar{height:8px;background:#4caf50;width:0}
+
+#wrap{width:calc(101*var(--sz));margin:0 auto;position:relative;background:#000}
+canvas{position:absolute;left:0;top:0}
+
+#star{position:absolute;pointer-events:none;display:none;transform:translate(-8px,-8px)}
+#star svg{width:16px;height:16px;fill:gold}
+
+#waiting,#overlay{display:none;position:fixed;inset:0;z-index:20;align-items:center;justify-content:center;font-family:'Orbitron',sans-serif;font-size:48px;color:#fff;background:rgba(0,0,0,.75)}
+
+button{font-family:'Orbitron',sans-serif}
+
+/* ── SHOP MENU ─────────────────────────────────────────────── */
+#shopMenu{
+  position:fixed;
+  top:90px; left:50%; transform:translateX(-50%);
+  background:rgba(0,0,0,.9); border:2px solid #555; padding:12px; z-index:30;
+  display:flex; gap:10px; flex-wrap:wrap;
+}
+#shopMenu button{min-width:160px}
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <span id="credits">Fuel 0</span>
+  <span id="bucks">Bucks 0</span>
+  <button id="reset">Reset</button>
+
+  <!-- firing -->
+  <button id="weapon" style="display:none;">Weapon: Laser</button>
+  <button id="confirm" style="display:none;" disabled>Confirm Shots</button>
+  <span  id="enemyInfo" style="display:none;"></span>
+
+  <!-- move -->
+  <button id="shopBtn"      style="display:none;">Shop</button>   
+  <button id="end" style="display:none;">End Turn</button>
+  <button id="confirmBeacon" style="display:none;">Confirm Beacon</button>
+  <span id="moveInfo" style="display:none;"></span>
+
+  <!-- base -->
+  <button id="baseOk" style="display:none;">Confirm Base</button>
+</div>
+
+<!-- ①‑B  SHOP MENU (initially hidden) ───────────────────────────── -->
+<div id="shopMenu" style="display:none;">
+    <button class="shopItem" data-item="beacon"       data-label="Beacon">Beacon $25</button>
+    <button class="shopItem" data-item="laser_spread" data-label="Laser Spread">Laser Spread $30</button>
+    <button class="shopItem" data-item="laser_shots"  data-label="Laser Shots">Laser Shots $35</button>
+    <button class="shopItem" data-item="plunder"      data-label="Plunderer Instinct">Plunderer Instinct $30</button>
+    <button class="shopItem" data-item="gasman"       data-label="Gas Man">Gas Man $30</button>
+
+</div>
+
+<div id="wrap">
+
+  <canvas id="bg"   width="1010" height="1010"></canvas>
+  <canvas id="draw" width="1010" height="1010"></canvas>
+
+  <div id="star">
+    <svg viewBox="0 0 100 100"><polygon points="50,5 61,38 95,38 67,58 78,90 50,70 22,90 33,58 5,38 39,38"/></svg>
+  </div>
+</div>
+
+<div id="waiting" class="flex">Waiting for opponent…</div>
+<div id="overlay" class="flex"></div>
+
+<script>
+/******************** CONSTANTS & CANVAS SETUP ********************/
+const SZ=10,N=101,LASER_R=5,BOMB_R=2,BOMB_RANGE=8;
+
+const BG=document.getElementById('bg').getContext('2d');
+const ctx=document.getElementById('draw').getContext('2d');
+const socket=io();
+
+/******************** STATE ********************/
+let role=null,phase={X:'base',O:'base'};
+let ships=[],oldShips=[],radii=[0,0,0];
+let gas=new Set(),starT=new Set(),gem=new Set(),sgem=new Set(),shop=new Set();
+let enemyOld=[],enemyRad=[],enemyCr=[],enemyBk=[],circleTog={};
+let shots=[];
+let currentWeapon='laser';
+let baseCell=null;
+let placingBase=false;
+let gameEnded=false;
+let upg = { laser_spread: 0, laser_shots: 0, plunder: 0, gasman: 0 };
+let beaconCount = 0;
+
+// beacons
+let beacons=[];
+let pendingBeacon=null;
+let draggingBeacon=false;
+
+/******************** UTILS ********************/
+const cellXY=id=>[id%N,Math.floor(id/N)];
+const toId=(x,y)=>y*N+x;
+/* ----- upgrade helpers (must appear before first use) ----- */
+function shotRadius() {           // current laser radius incl. upgrades
+  return LASER_R + upg.laser_spread;
+}
+function shotCap() {              // total shots allowed this turn
+  return 3 + upg.laser_shots;
+}
+
+function canvasCell(e){const r=ctx.canvas.getBoundingClientRect();
+const x=Math.floor((e.clientX-r.left)/SZ),y=Math.floor((e.clientY-r.top)/SZ);
+if(x>=0&&x<N&&y>=0&&y<N)
+    return{x,y,id:toId(x,y)};}
+function clear(){ctx.clearRect(0,0,1010,1010);}
+function drawTri(x,y){const size=4*SZ,cx=x*SZ+SZ/2,cy=y*SZ;ctx.fillStyle='silver';
+ctx.beginPath();ctx.moveTo(cx,cy);
+ctx.lineTo(cx-size/2,cy+size);
+ctx.lineTo(cx+size/2,cy+size);
+ctx.closePath();ctx.fill();}
+function drawResDot(x,y,color){ctx.fillStyle=color;
+ctx.beginPath();
+ctx.arc(x*SZ+SZ/2,y*SZ+SZ/2,SZ/3,0,2*Math.PI);ctx.fill();}
+function distanceId(id,x,y){const[xx,yy]=cellXY(id);
+return Math.hypot(x-xx,y-yy);}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+
+/******************** TERRAIN BACKGROUND ********************/
+function paintTerrain(){BG.clearRect(0,0,1010,1010);
+  const fill=(set,col)=>{BG.fillStyle=col;
+  set.forEach(id=>{const[x,y]=cellXY(id);
+  BG.fillRect(x*SZ,y*SZ,SZ,SZ);});};
+  fill(gas ,'rgba(  0,120,255,.25)');
+  fill(starT,'rgba(  0,200,255,.6)');
+  fill(gem ,'rgba(150,  0,  0,.25)');
+  fill(sgem,'rgba(255,  0,  0,.6)');
+  BG.fillStyle='purple';shop.forEach(id=>{const[x,y]=cellXY(id);BG.fillRect(x*SZ,y*SZ,SZ,SZ);});
+}
+
+/******************** BARS (unchanged) ********************/
+const barsDiv=document.getElementById('bars');
+function refreshBars(){barsDiv.innerHTML='';radii.forEach(r=>{const wrap=document.createElement('div');wrap.className='barWrap';const bar=document.createElement('div');bar.className='bar';bar.style.width=Math.min(r,20)*5+'%';wrap.appendChild(bar);barsDiv.appendChild(wrap);});}
+
+/******************** RENDER ********************/
+function drawBeaconArrow(x,y,dir,color){ctx.fillStyle=color;ctx.save();ctx.translate(x*SZ+SZ/2,y*SZ+SZ/2);ctx.rotate((dir*Math.PI/2)+3*Math.PI/4);ctx.beginPath();ctx.moveTo(0,-6);ctx.lineTo(3,6);ctx.lineTo(-3,6);ctx.closePath();ctx.fill();ctx.restore();}
+function render(){if(gameEnded)return;ctx.clearRect(0,0,1010,1010);  // cost circles
+  ctx.strokeStyle='cyan';oldShips.forEach((o,i)=>{if(radii[i]>0){const[x,y]=cellXY(o);ctx.beginPath();ctx.arc(x*SZ+SZ/2,y*SZ+SZ/2,radii[i]*SZ,0,2*Math.PI);ctx.stroke();}});
+  // old markers
+  ctx.strokeStyle='yellow';oldShips.forEach(id=>{if(!ships.includes(id)){const[x,y]=cellXY(id);ctx.strokeRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);}});
+  ctx.strokeStyle='red';enemyOld.forEach(id=>{const[x,y]=cellXY(id);ctx.strokeRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);});
+  // enemy intel circles
+  Object.values(circleTog).forEach(o=>{
+  if(o.v){
+    const[x,y]=cellXY(o.id);
+    ctx.strokeStyle='rgba(0,150,255,.4)';
+    ctx.beginPath();
+    ctx.arc(x*SZ+SZ/2,y*SZ+SZ/2,o.r*SZ,0,2*Math.PI);
+    ctx.stroke();
+  }
+});
+  // ships + resource dots
+  ships.forEach(id=>{
+    const[x,y]=cellXY(id);
+    drawTri(x,y);
+    if(gas.has(id))   drawResDot(x,y,'blue');
+    else if(starT.has(id)) drawResDot(x,y,'cyan');
+    else if(gem.has(id))   drawResDot(x,y,'red');
+    else if(sgem.has(id))  drawResDot(x,y,'crimson');
+    else if(shop.has(id))  drawResDot(x,y,'purple');
+  });
+  // shots
+  shots.forEach(s=>{
+  const r = s.type==='bomb'?BOMB_R:shotRadius();
+  ctx.fillStyle=s.type==='bomb'?'rgba(255,0,0,0.25)':'rgba(0,255,0,0.25)';for(let dy=-r;dy<=r;dy++){for(let dx=-r;dx<=r;dx++){const x=s.x+dx,y=s.y+dy;if(x<0||y<0||x>=N||y>=N)continue;if(Math.hypot(dx,dy)<=r)ctx.fillRect(x*SZ,y*SZ,SZ,SZ);}}});
+  // beacons
+  beacons.forEach(b=>{const[x,y]=cellXY(b.cell);drawBeaconArrow(x,y,b.dir,b.owner===role?'orange':'blue');
+    if(b.owner===role){ctx.fillStyle=b.hit?'rgba(0,255,0,0.25)':'rgba(100,100,100,0.25)';let x0=x,y0=y,x1=b.dir===0||b.dir===3?N:0,y1=b.dir===0||b.dir===1?N:0;if(b.dir===1||b.dir===2)x1=0;else x1=N;if(b.dir===2||b.dir===3)y1=0;else y1=N;const width=(Math.abs(x1-x0))*SZ+SZ,height=(Math.abs(y1-y0))*SZ+SZ;ctx.fillRect(Math.min(x0,x1)*SZ,Math.min(y0,y1)*SZ,width,height);}});
+  if(pendingBeacon){const{x,y,dir}=pendingBeacon;drawBeaconArrow(x,y,dir,'white');}
+}
+
+/******************** BASE PLACEMENT ********************/
+const starDiv=document.getElementById('star');
+function setStarPos(cell){starDiv.style.left=cell.x*SZ+'px';starDiv.style.top=cell.y*SZ+'px';}
+ctx.canvas.addEventListener('mousedown',e=>{if(phase[role]!=='base')return;const c=canvasCell(e);if(!c)return;placingBase=true;baseCell=c;setStarPos(c);starDiv.style.display='block';});
+ctx.canvas.addEventListener('mousemove',e=>{if(!placingBase)return;const c=canvasCell(e);if(!c)return;baseCell=c;setStarPos(c);});
+window.addEventListener('mouseup',()=>{placingBase=false;});
+
+/******************** WEAPON TOGGLE ********************/
+document.getElementById('weapon').onclick=()=>{currentWeapon=currentWeapon==='laser'?'bomb':'laser';document.getElementById('weapon').textContent='Weapon: '+(currentWeapon==='laser'?'Laser':'Bomb');};
+
+/******************** FIRING PHASE SHOTS ********************/
+let shotDrag=null;
+ctx.canvas.addEventListener('mousedown',e=>{if(phase[role]!=='fire')return;if(e.button!==0)return;
+const c=canvasCell(e);
+if(!c)return;
+const idx=shots.findIndex(s=>dist(s,c)<= (s.type==='bomb'?BOMB_R:shotRadius()));
+shotDrag=(idx>-1)?idx:(shots.length<shotCap()?shots.push({x:c.x,y:c.y,id:c.id,type:currentWeapon})-1:null);
+if(shotDrag!==null)updateShot(c,true);} );
+ctx.canvas.addEventListener('mousemove',e=>{if(shotDrag===null)return;const c=canvasCell(e);if(c)updateShot(c,false);});
+window.addEventListener('mouseup',()=>{shotDrag=null;});
+function updateShot(c,forceType){
+if(forceType)shots[shotDrag].type=currentWeapon;
+const t=shots[shotDrag].type;
+if(t==='bomb'){
+    const legal=ships.some(id=>distanceId(id,c.x,c.y)<=BOMB_RANGE);
+    if(!legal)
+        return;}
+shots[shotDrag].x=c.x;
+shots[shotDrag].y=c.y;
+shots[shotDrag].id=c.id;
+if (shots.length > shotCap()) shots.length = shotCap();   // trim any extras
+render();
+document.getElementById('confirm').disabled=(shots.length< shotCap());
+}
+
+/******************** ENEMY INTEL RIGHT-CLICK ********************/
+ctx.canvas.addEventListener('contextmenu',e=>e.preventDefault());
+ctx.canvas.addEventListener('mousedown',e=>{if(e.button!==2)return;const c=canvasCell(e);if(!c)return; // rotation if pending beacon
+  if(pendingBeacon){pendingBeacon.dir=(pendingBeacon.dir+1)%4;render();return;}
+  if(phase[role]!=='move' && phase[role]!=='fire')return;const idx=enemyOld.indexOf(c.id);if(idx>-1){const key=c.id;circleTog[key]=(circleTog[key])?({...circleTog[key],v:!circleTog[key].v}):{id:key,r:enemyRad[idx],c:enemyCr[idx],b:enemyBk[idx],v:true};render();}}
+);
+
+/******************** MOVE‑PHASE DRAG HANDLERS ********************/
+let dragShip=null,dragRad=null;
+function distOld(i){const[oX,oY]=cellXY(oldShips[i]);const[nX,nY]=cellXY(ships[i]);return Math.hypot(oX-nX,oY-nY);}
+function sendMove(){socket.emit('move_packet',{ships:[...ships],radii:[...radii]});}
+
+ctx.canvas.addEventListener('mousedown',e=>{
+  if(phase[role]!=='move')return;
+  const cell=canvasCell(e);if(!cell)return;
+  if(pendingBeacon){draggingBeacon=true;pendingBeacon={...pendingBeacon,x:cell.x,y:cell.y,id:cell.id};render();return;}
+  if(e.button===0){
+    const idx=ships.indexOf(cell.id);
+    if(idx>-1){
+      if(radii[idx]===0){dragRad=idx;return;}  // start radius drag immediately
+      dragShip=idx;return;
+    }
+    for(let i=0;i<3;i++){
+      const[oX,oY]=cellXY(oldShips[i]);
+      if(Math.abs(Math.hypot(cell.x-oX,cell.y-oY)-radii[i])<=0.3){dragRad=i;return;}
+    }
+  }
+});
+
+ctx.canvas.addEventListener('mousemove',e=>{
+  const cell=canvasCell(e);if(!cell)return;
+  if(draggingBeacon&&pendingBeacon){pendingBeacon={...pendingBeacon,x:cell.x,y:cell.y,id:cell.id};render();return;}
+  if(phase[role]!=='move')return;
+  if(dragShip!==null){
+    ships[dragShip]=cell.id;
+    const d=distOld(dragShip);if(d>radii[dragShip]){radii[dragShip]=d;refreshBars();}
+    sendMove();render();
+  }else if(dragRad!==null){
+    radii[dragRad]=Math.max(distOld(dragRad),Math.hypot(cell.x-cellXY(oldShips[dragRad])[0],cell.y-cellXY(oldShips[dragRad])[1]));
+    refreshBars();sendMove();render();
+  }
+});
+window.addEventListener('mouseup',()=>{dragShip=null;dragRad=null;draggingBeacon=false;});
+
+/******************** BUTTONS ********************/
+document.getElementById('confirm').onclick=()=>{const payload=shots.map(s=>({cell:s.id,type:s.type}));socket.emit('fire_confirm',{shots:payload});};
+document.getElementById('end').onclick=()=>{socket.emit('end_turn');document.getElementById('waiting').style.display='flex';};
+document.getElementById('reset').onclick=()=>socket.emit('reset_request');
+document.getElementById('baseOk').onclick=()=>{if(!baseCell)return;socket.emit('set_base',{cell:baseCell.id});};
+document.getElementById('confirmBeacon').onclick=()=>{if(!pendingBeacon)return;socket.emit('confirm_beacon',{cell:pendingBeacon.id,dir:pendingBeacon.dir});pendingBeacon=null;document.getElementById('confirmBeacon').style.display='none';render();};
+
+/******************** SOCKET EVENTS ********************/
+socket.on('role',d=>{
+  role=d.role;ships=d.ships;document.getElementById('credits').textContent='Fuel '+d.credits;document.getElementById('bucks').textContent='Bucks '+d.bucks;gas=new Set(d.map.gas);starT=new Set(d.map.star);gem=new Set(d.map.gem);sgem=new Set(d.map.sgem);shop=new Set(d.map.shop);paintTerrain();if(d.needBase){phase[role]='base';starDiv.style.display='block';document.getElementById('baseOk').style.display='inline';}beacons=d.beacons;render();});
+
+socket.on('state',s=>{
+phase=s.phase;
+radii=[0,0,0];
+document.getElementById('credits').textContent='Fuel '+s.credits[role];
+document.getElementById('bucks').textContent='Bucks '+s.bucks[role];
+if (shopMenu.style.display === 'block') refreshShopButtons();
+updateUI();
+if(phase[role]==='fire'){document.getElementById('waiting').style.display='none';
+shots=[];}
+});
+
+socket.on('base_confirmed',()=>{document.getElementById('baseOk').style.display='none';starDiv.style.pointerEvents='none';phase[role]='fire';updateUI();});
+
+socket.on('waiting',()=>document.getElementById('waiting').style.display='flex');
+
+socket.on('start_move',d=>{oldShips=d.old;radii=[0,0,0];shots=[];refreshBars();updateUI();render();});
+
+socket.on('enemy_markers',d=>{enemyOld=d.old;enemyRad=d.rad;enemyCr=d.cr;enemyBk=d.bk;circleTog={};d.old.forEach((id,i)=>{circleTog[id]={id,r:d.rad[i],c:d.cr[i],b:d.bk[i],v:true}});render();});
+
+socket.on('result',d=>{const[x,y]=cellXY(d.cell);ctx.fillStyle=d.hit?'orange':'#555';ctx.fillRect(x*SZ+2,y*SZ+2,SZ-4,SZ-4);});
+
+socket.on('opponent_guess',d=>{const[x,y]=cellXY(d.cell);ctx.fillStyle='rgba(0,180,255,.4)';ctx.fillRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);});
+
+socket.on('reset',()=>location.reload());
+
+socket.on('game_over',d=>{gameEnded=true;document.getElementById('overlay').textContent=(d.result==='victory'?'VICTORY!':'DEFEAT');document.getElementById('overlay').style.display='flex';});
+
+socket.on('beacon_ready',d=>{ // server accepted purchase
+  pendingBeacon={x:50,y:50,id:toId(50,50),dir:0};document.getElementById('confirmBeacon').style.display='inline';updateUI();render();});
+
+socket.on('new_beacon',d=>{beacons.push(d);render();});
+
+socket.on('move_preview',d=>{
+  document.getElementById('moveInfo').textContent=`Move Cost: -${d.cost} Fuel, Resource Collection: ${d.bucks} Bucks, ${d.fuel} Fuel`;
+
+});
+
+/************* NEW enemy_totals handler *************/
+socket.on('enemy_totals',d=>{
+  const s=`Enemy Collection: ${d.bucks} Bucks, ${d.fuel} Fuel`;
+  document.getElementById('enemyInfo').textContent=s;
+});
+
+/************* tweak updateUI to show / hide span ****/
+function updateUI(){
+  const w=document.getElementById('weapon'), c=document.getElementById('confirm'),
+        e=document.getElementById('end'),
+        cb=document.getElementById('confirmBeacon'), sbtn=document.getElementById('shopBtn'),
+        m=document.getElementById('moveInfo'), ei=document.getElementById('enemyInfo'),
+        shopMenu=document.getElementById('shopMenu');
+
+  w.style.display = (phase[role] === 'fire') ? 'inline' : 'none';
+  ei.style.display = (phase[role] === 'fire') ? 'inline' : 'none';
+  cb.style.display = pendingBeacon ? 'inline' : 'none';
+
+  if (phase[role] === 'fire') {
+    c.style.display = 'inline';
+    e.style.display = 'none';
+    m.style.display = 'none';
+    sbtn.style.display = 'none';          // Hide shop button during fire phase
+    shopMenu.style.display = 'none';      // Ensure shop menu is closed
+    c.disabled = (shots.length < shotCap());
+  } else if (phase[role] === 'move') {
+    c.style.display = 'none';
+    e.style.display = 'inline';
+    m.style.display = 'inline';
+    ei.style.display = 'none';            // Hide during move phase
+    sbtn.style.display = 'inline';        // Show shop button during move phase
+  } else {
+    c.style.display = e.style.display = m.style.display = 'none';
+    ei.style.display = 'none';
+    sbtn.style.display = 'none';
+    shopMenu.style.display = 'none';      // Ensure shop menu is closed
+  }
+}
+
+// SHOP MENU
+const shopBtn = document.getElementById('shopBtn');
+
+const shopMenu = document.getElementById('shopMenu');
+
+function refreshShopButtons() {
+  const myBucks = parseInt(document.getElementById('bucks').textContent.split(' ')[1], 10);
+  const disc = oldShips.some(s => shop.has(s)) ? 10 : 0;
+
+  shopMenu.querySelectorAll('.shopItem').forEach(b => {
+    const key = b.dataset.item;
+    const base = { beacon: 25, laser_spread: 30, laser_shots: 35, plunder: 30, gasman: 30 }[key];
+    const count = (key === 'beacon') ? beaconCount : upg[key] || 0;
+    const cost = base - disc;
+
+    b.textContent = `${b.dataset.label} $${cost} (x${count})`;
+    b.disabled = (myBucks < cost);
+  });
+}
+
+
+shopBtn.onclick = () => {
+  refreshShopButtons();  // Consolidated to one function call
+  shopMenu.style.display = (shopMenu.style.display === 'none') ? 'block' : 'none';
+};
+
+
+
+shopMenu.querySelectorAll('.shopItem').forEach(btn => {
+  btn.onclick = () => {
+    const key = btn.dataset.item;
+    const cost = parseInt(btn.textContent.split('$')[1].split(' ')[0], 10);
+
+    const bucksElem = document.getElementById('bucks');
+    const myBucks = parseInt(bucksElem.textContent.split(' ')[1], 10);
+
+    if (myBucks < cost) return;  // Prevent clicking when funds are insufficient
+
+    // Emit the purchase event
+    socket.emit('shop_item', { item: key });
+
+    // Deduct bucks and update immediately
+    bucksElem.textContent = `Bucks ${myBucks - cost}`;
+
+    if (key === 'beacon') {
+      beaconCount++;
+    } else {
+      upg[key]++;
+    }
+
+    // Update button states and counts
+    refreshShopButtons();
+    shopMenu.style.display = 'none';
+  };
+});
+
+</script>
+</body>
+</html>
