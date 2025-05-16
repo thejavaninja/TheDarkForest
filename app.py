@@ -11,11 +11,11 @@ BOARD        = 101
 NUM_SHIPS    = 3
 
 LASER_RADIUS = 5
-BOMB_RADIUS  = 2
+BOMB_RADIUS  = 1
 BOMB_RANGE   = 8          # bomb must be ≤ 8 from a friendly ship
 SHOT_LIMIT   = 3
 
-HIT_CREDIT   = 100        # credits per laser hit on enemy ship
+HIT_CREDIT   = 0        # old gas per laser hit on enemy ship
 
 # terrain rewards
 GAS_CR  = 50
@@ -112,7 +112,7 @@ def start_pos():
 game = {p: {'sid': None,
             'ships': start_pos(),
             'old':   [],
-            'credits': 0,
+            'credits': 100,
             'bucks':   0,
             'base':    None,
             # ← NEW: stacking upgrades
@@ -126,6 +126,7 @@ game = {p: {'sid': None,
 
 player_phase   = {'X':'base', 'O':'base'}   # 'base'|'fire'|'move'|'done'
 moves_pending  = {'X': None, 'O': None}
+shots_pending  = {'X': None, 'O': None}   # <-- add this
 players        = {}                         # sid ➜ role
 beacons        = []                         # list of dicts {owner,cell,dir,hit}
 game_over      = False
@@ -214,59 +215,115 @@ def set_base(data):
 # ── FIRING PHASE ────────────────────────────────────────
 @socketio.on('fire_confirm')
 def fire_confirm(data):
-    global game_over
+    global game_over, shots_pending
     role = players.get(request.sid)
     if game_over or role is None or player_phase[role] != 'fire':
         return
 
-    opp = 'O' if role=='X' else 'X'
-    upg  = game[role]['upg']
-    cap  = SHOT_LIMIT   + upg['laser_shots']
-    rad  = LASER_RADIUS + upg['laser_spread']
+    opp = 'O' if role == 'X' else 'X'
+    upg = game[role]['upg']
+    cap = SHOT_LIMIT + upg['laser_shots']
+    rad = LASER_RADIUS + upg['laser_spread']
 
     shots = data.get('shots', [])[:cap]
     if len(shots) < cap:
+        emit('message', f'Place {cap} shots before confirming.')
+        return
 
-        emit('message', f'Place {cap} shots before confirming.'); return
-
+    final_shots = []
     for s in shots:
         cell  = s.get('cell')
         wtype = s.get('type')
-        if not isinstance(cell,int) or wtype not in ('laser','bomb'): continue
+        if not isinstance(cell, int) or wtype not in ('laser', 'bomb'):
+            continue
 
-        # legality for bomb
-        if wtype=='bomb' and all(dist_cells(cell,sh) > BOMB_RANGE for sh in game[role]['ships']):
-            continue  # illegal bomb -> ignore shot
+        # bomb legality
+        if wtype == 'bomb' and all(dist_cells(cell, sh) > BOMB_RANGE for sh in game[role]['ships']):
+            continue
 
-        # send visual feedback
-        emit('result',{'cell':cell,'hit':False,'type':wtype},room=game[role]['sid'])
+        final_shots.append({'cell': cell, 'type': wtype})
+
+        # visual feedback
+        emit('result', {'cell': cell, 'hit': False, 'type': wtype}, room=game[role]['sid'])
         if game[opp]['sid']:
-            emit('opponent_guess',{'cell':cell,'type':wtype},room=game[opp]['sid'])
+            emit('opponent_guess', {'cell': cell, 'type': wtype}, room=game[opp]['sid'])
 
-        # evaluate hit
-        if wtype=='laser':
-            for sh in game[opp]['ships']:
-                if dist_cells(cell,sh) <= rad:
-                    game[role]['credits'] += HIT_CREDIT
-                    emit('result',{'cell':cell,'hit':True,'type':wtype},room=game[role]['sid'])
-                    break
-        else:  # bomb
+        # bomb can end game immediately
+        if wtype == 'bomb':
             base = game[opp]['base']
-            if base and dist_cells(cell,base) <= BOMB_RADIUS:
-                whistle_victory(role,opp); return
+            if base and dist_cells(cell, base) <= BOMB_RADIUS:
+                whistle_victory(role, opp)
+                return
 
-    # advance to move phase
-    game[role]['old']  = game[role]['ships'][:]
-    player_phase[role] = 'move'
-    emit('start_move',{'old':game[role]['old']})
+    shots_pending[role] = final_shots
+    emit('waiting')
+    # do NOT change phase to 'wait' — stay in 'fire'
+    
+    resolve_if_both_fired()
+
+
+
+def resolve_if_both_fired():
+    global shots_pending
+    if shots_pending['X'] is None or shots_pending['O'] is None:
+        return
+
+    transfer = {p: {'bucks': 0, 'fuel': 0} for p in ('X', 'O')}
+
+    for atk in ('X', 'O'):
+        defn = 'O' if atk == 'X' else 'X'
+        upg = game[atk]['upg']
+        rad = LASER_RADIUS + upg['laser_spread']
+
+        hit_ships = set()
+        for s in shots_pending[atk]:
+            if s['type'] != 'laser':
+                continue
+            cx, cy = divmod(s['cell'], BOARD)[::-1]
+            for sh in game[defn]['ships']:
+                sx, sy = divmod(sh, BOARD)[::-1]
+                if math.hypot(cx - sx, cy - sy) <= rad:
+                    hit_ships.add(sh)
+
+        hits = min(len(hit_ships), 3)
+        if hits == 0:
+            continue
+
+        game[atk]['credits'] += HIT_CREDIT * hits
+        frac = hits / 3.0
+
+        bucks_take = int(game[defn]['bucks'] * frac)
+        fuel_take = 0
+        if game[defn]['credits'] >= 50:
+            desired = int(game[defn]['credits'] * frac)
+            fuel_take = max(0, min(desired, game[defn]['credits'] - 50))
+
+        transfer[atk]['bucks'] += bucks_take
+        transfer[atk]['fuel']  += fuel_take
+        transfer[defn]['bucks'] -= bucks_take
+        transfer[defn]['fuel']  -= fuel_take
+
+    for p in ('X', 'O'):
+        game[p]['bucks']   = max(0, game[p]['bucks'] + transfer[p]['bucks'])
+        game[p]['credits'] = max(0, game[p]['credits'] + transfer[p]['fuel'])
+        game[p]['old'] = game[p]['ships'][:]
+        player_phase[p] = 'move'
+
+        sid = game[p]['sid']
+        if sid:
+            emit('start_move', {'old': game[p]['old']}, room=sid)
+
+    shots_pending['X'] = shots_pending['O'] = None
     send_state()
+
+
 
 # ── LIVE MOVE PACKETS ───────────────────────────────────
 @socketio.on('move_packet')
 def move_packet(data):
     """
     data = {'ships':[ids], 'radii':[floats]}
-    Sends a live preview of move‑cost and resource pickup to the mover only.
+    Sends a live preview of move‑cost and resource pickup to tH0812he mover only.
     """
     role = players.get(request.sid)
     if role is None or player_phase[role] != 'move':
@@ -282,11 +339,16 @@ def move_packet(data):
     fuel_gain  = sum(STAR_CR if s in star else GAS_CR if s in gas else 0 for s in ships)
     bucks_gain = sum(SGEM_BU if s in sgem else GEM_BU if s in gem else 0 for s in ships)
 
+    current = game[role]['credits']
+    future_fuel = current + fuel_gain - cost          # fuel after this move
+
     emit('move_preview', {
-        'cost' : cost,
-        'fuel' : fuel_gain,
-        'bucks': bucks_gain
+        'cost'  : cost,
+        'fuel'  : fuel_gain,
+        'bucks' : bucks_gain,
+        'can_end': future_fuel >= 0                   # ← new field
     }, room=request.sid)
+
 
     
 # ── SHOP PURCHASE (Beacon / Upgrades) ───────────────────────────
@@ -356,6 +418,65 @@ def confirm_beacon(data):
     # share with everyone (opponent does NOT know hit result)
     socketio.emit('new_beacon',{'owner':role,'cell':cell,'dir':dir,'hit':hit})
 
+def resolve_fire_phase():
+    """Apply laser‑hit plunder, then start the move phase for both players."""
+    global shots_pending
+
+    # 1) figure hits per attacker
+    transfer = {p: {'bucks': 0, 'fuel': 0} for p in ('X', 'O')}
+    for atk, shots in shots_pending.items():
+        if shots is None:
+            continue
+        defn = 'O' if atk == 'X' else 'X'
+        rad  = LASER_RADIUS + game[atk]['upg']['laser_spread']
+
+        # unique ships hit
+        hit_ships = set()
+        for s in shots:
+            if s['type'] != 'laser':
+                continue
+            cx, cy = divmod(s['cell'], BOARD)[::-1]
+            for sh in game[defn]['ships']:
+                sx, sy = divmod(sh, BOARD)[::-1]
+                if math.hypot(cx - sx, cy - sy) <= rad:
+                    hit_ships.add(sh)
+
+        hits = min(len(hit_ships), 3)       # cap at 3
+        if hits == 0:
+            continue
+
+        frac = hits / 3.0                   # 1/3, 2/3, or 1
+        # ---- bucks transfer ----
+        bucks_take = int(game[defn]['bucks'] * frac)
+        # ---- fuel transfer (respect 50‑fuel floor) ----
+        enemy_fuel = game[defn]['credits']
+        if enemy_fuel >= 50:
+            desired = int(enemy_fuel * frac *5/3)
+            fuel_take = max(0, min(desired, enemy_fuel - 50))
+        else:
+            fuel_take = 0
+
+        transfer[atk]['bucks'] += bucks_take
+        transfer[atk]['fuel']  += fuel_take
+        transfer[defn]['bucks'] -= bucks_take
+        transfer[defn]['fuel']  -= fuel_take
+
+    # 2) apply transfers now
+    for p in ('X', 'O'):
+        game[p]['bucks']   = max(0, game[p]['bucks']   + transfer[p]['bucks'])
+        game[p]['credits'] = max(0, game[p]['credits'] + transfer[p]['fuel'])
+
+    # 3) advance to move phase for both
+    for p in ('X', 'O'):
+        game[p]['old'] = game[p]['ships'][:]      # mark start positions
+        player_phase[p] = 'move'
+        sid = game[p]['sid']
+        if sid:
+            emit('start_move', {'old': game[p]['old']}, room=sid)
+
+    shots_pending = {'X': None, 'O': None}        # clear for next turn
+    send_state()
+
 # ── END TURN ─────────────────────────────────────────────
 @socketio.on('end_turn')
 def end_turn():
@@ -369,6 +490,22 @@ def end_turn():
             'ships': game[role]['old'][:],   # stay where they were
             'radii': [0, 0, 0]               # zero cost circles
         }
+        # ------------------------------------------------------------------
+    #  prevent ending turn if fuel would go negative
+    ships = moves_pending[role]['ships']
+    radii = moves_pending[role]['radii']
+    fixed = [max(r, dist_cells(o, n)) for o, n, r in zip(game[role]['old'], ships, radii)]
+
+    upg  = game[role]['upg']
+    fuel_gain = sum((STAR_CR + upg['gasman']*50) if s in star
+               else (GAS_CR + upg['gasman']*25) if s in gas else 0
+               for s in ships)
+
+    projected = game[role]['credits'] + fuel_gain - math.ceil(sum(fixed))
+    if projected < 0:
+        emit('message', 'Not enough fuel for that move.')
+        return
+    # ------------------------------------------------------------------
 
     player_phase[role] = 'done'
     emit('waiting')

@@ -267,7 +267,9 @@ window.addEventListener('mouseup',()=>{dragShip=null;dragRad=null;draggingBeacon
 
 /******************** BUTTONS ********************/
 document.getElementById('confirm').onclick=()=>{const payload=shots.map(s=>({cell:s.id,type:s.type}));socket.emit('fire_confirm',{shots:payload});};
-document.getElementById('end').onclick=()=>{socket.emit('end_turn');document.getElementById('waiting').style.display='flex';};
+document.getElementById('end').onclick=()=>{
+socket.emit('end_turn');
+};
 document.getElementById('reset').onclick=()=>socket.emit('reset_request');
 document.getElementById('baseOk').onclick=()=>{if(!baseCell)return;socket.emit('set_base',{cell:baseCell.id});};
 document.getElementById('confirmBeacon').onclick=()=>{if(!pendingBeacon)return;socket.emit('confirm_beacon',{cell:pendingBeacon.id,dir:pendingBeacon.dir});pendingBeacon=null;document.getElementById('confirmBeacon').style.display='none';render();};
@@ -283,7 +285,7 @@ document.getElementById('credits').textContent='Fuel '+s.credits[role];
 document.getElementById('bucks').textContent='Bucks '+s.bucks[role];
 if (shopMenu.style.display === 'block') refreshShopButtons();
 updateUI();
-if(phase[role]==='fire'){document.getElementById('waiting').style.display='none';
+if(phase[role]==='fire' || phase[role]==='move'){document.getElementById('waiting').style.display='none';
 shots=[];}
 });
 
@@ -291,7 +293,14 @@ socket.on('base_confirmed',()=>{document.getElementById('baseOk').style.display=
 
 socket.on('waiting',()=>document.getElementById('waiting').style.display='flex');
 
-socket.on('start_move',d=>{oldShips=d.old;radii=[0,0,0];shots=[];refreshBars();updateUI();render();});
+socket.on('start_move',d=>{
+oldShips=d.old;
+radii=[0,0,0];
+shots=[];
+refreshBars();
+updateUI();
+render();
+});
 
 socket.on('enemy_markers',d=>{enemyOld=d.old;enemyRad=d.rad;enemyCr=d.cr;enemyBk=d.bk;circleTog={};d.old.forEach((id,i)=>{circleTog[id]={id,r:d.rad[i],c:d.cr[i],b:d.bk[i],v:true}});render();});
 
@@ -308,10 +317,15 @@ socket.on('beacon_ready',d=>{ // server accepted purchase
 
 socket.on('new_beacon',d=>{beacons.push(d);render();});
 
-socket.on('move_preview',d=>{
-  document.getElementById('moveInfo').textContent=`Move Cost: -${d.cost} Fuel, Resource Collection: ${d.bucks} Bucks, ${d.fuel} Fuel`;
+socket.on('move_preview', d => {
+  // show projected cost / gain
+  document.getElementById('moveInfo').textContent =
+      `Move Cost: -${d.cost} Fuel, Resource Collection: ${d.bucks} Bucks, ${d.fuel} Fuel`;
 
+  // grey‑out End‑Turn button if the move would send fuel below zero
+  document.getElementById('end').disabled = !d.can_end;
 });
+
 
 /************* NEW enemy_totals handler *************/
 socket.on('enemy_totals',d=>{
