@@ -243,10 +243,26 @@ def fire_confirm(data):
 
         final_shots.append({'cell': cell, 'type': wtype})
 
-        # visual feedback
-        emit('result', {'cell': cell, 'hit': False, 'type': wtype}, room=game[role]['sid'])
+                # --------------------------------------------------------------
+        #  visual feedback NOW carries the real hit flag for the shooter
+        is_hit = False
+        if wtype == 'laser':
+            for sh in game[opp]['ships']:
+                if dist_cells(cell, sh) <= rad:
+                    is_hit = True
+                    break
+
+        # to the firing player
+        emit('result',
+             {'cell': cell, 'hit': is_hit, 'type': wtype},
+             room=game[role]['sid'])
+
+        # opponent still sees only the guess, never whether it hit
         if game[opp]['sid']:
-            emit('opponent_guess', {'cell': cell, 'type': wtype}, room=game[opp]['sid'])
+            emit('opponent_guess',
+                 {'cell': cell, 'type': wtype},
+                 room=game[opp]['sid'])
+        # --------------------------------------------------------------
 
         # bomb can end game immediately
         if wtype == 'bomb':
@@ -566,7 +582,7 @@ def reset_request():
     for p in ('X','O'):
         game[p]['ships']   = start_pos()
         game[p]['old']     = []
-        game[p]['credits'] = 0
+        game[p]['credits'] = 100
         game[p]['bucks']   = 0
         game[p]['base']    = None
         moves_pending[p]   = None

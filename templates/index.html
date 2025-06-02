@@ -55,6 +55,19 @@ button{font-family:'Orbitron',sans-serif}
   <!-- base -->
   <button id="baseOk" style="display:none;">Confirm Base</button>
 </div>
+<button id="audioTest" style="position:fixed;top:0;right:0;z-index:40;">
+  🔊 Enable Sound
+</button>
+
+
+<!-- --- SPACE‑THEMED SFX ----------------------------------------- -->
+<audio id="sfxHit"  src="/static/sfx_hit.mp3" preload="auto"></audio>
+<audio id="sfxMiss" src="/static/sfx_miss.mp3" preload="auto"></audio>
+<audio id="sfxDefeat" src="/static/sfx_defeat.mp3" preload="auto"></audio>
+
+<!-- optional background music -->
+<audio id="bgm" src="/static/music_loop.mp3" preload="auto" loop></audio>
+
 
 <!-- ①‑B  SHOP MENU (initially hidden) ───────────────────────────── -->
 <div id="shopMenu" style="display:none;">
@@ -80,8 +93,17 @@ button{font-family:'Orbitron',sans-serif}
 <div id="overlay" class="flex"></div>
 
 <script>
+let audioReady = false;
+document.getElementById('audioTest').addEventListener('click', () => {
+  audioReady = true;
+  playSound('sfxHit');          // quick audible ping
+  const bgm = document.getElementById('bgm');
+  if (bgm) bgm.volume = 0.25, bgm.play().catch(()=>{});
+  document.getElementById('audioTest').style.display = 'none';
+});
+
 /******************** CONSTANTS & CANVAS SETUP ********************/
-const SZ=10,N=101,LASER_R=5,BOMB_R=2,BOMB_RANGE=8;
+const SZ=10,N=101,LASER_R=5,BOMB_R=1,BOMB_RANGE=8;
 
 const BG=document.getElementById('bg').getContext('2d');
 const ctx=document.getElementById('draw').getContext('2d');
@@ -115,6 +137,13 @@ function shotRadius() {           // current laser radius incl. upgrades
 function shotCap() {              // total shots allowed this turn
   return 3 + upg.laser_shots;
 }
+function playSound(id) {
+  if (!audioReady) return;              // don’t spam console before unlock
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.currentTime = 0;
+  el.play().catch(()=>{});
+}
 
 function canvasCell(e){const r=ctx.canvas.getBoundingClientRect();
 const x=Math.floor((e.clientX-r.left)/SZ),y=Math.floor((e.clientY-r.top)/SZ);
@@ -129,6 +158,25 @@ ctx.closePath();ctx.fill();}
 function drawResDot(x,y,color){ctx.fillStyle=color;
 ctx.beginPath();
 ctx.arc(x*SZ+SZ/2,y*SZ+SZ/2,SZ/3,0,2*Math.PI);ctx.fill();}
+function boom(x, y, color, duration=300) {
+  const radius = SZ * 6;                      // big flash
+  const steps  = 12;
+  let frame = 0;
+  const flash = () => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = color;
+    const r = radius * (1 - frame / steps);
+    ctx.beginPath();
+    ctx.arc(x*SZ+SZ/2, y*SZ+SZ/2, r, 0, 2*Math.PI);
+    ctx.fill();
+    ctx.restore();
+    frame++;
+    if (frame <= steps) requestAnimationFrame(flash);
+  };
+  flash();
+}
+
 function distanceId(id,x,y){const[xx,yy]=cellXY(id);
 return Math.hypot(x-xx,y-yy);}
 function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
@@ -181,7 +229,7 @@ function render(){if(gameEnded)return;ctx.clearRect(0,0,1010,1010);  // cost cir
   const r = s.type==='bomb'?BOMB_R:shotRadius();
   ctx.fillStyle=s.type==='bomb'?'rgba(255,0,0,0.25)':'rgba(0,255,0,0.25)';for(let dy=-r;dy<=r;dy++){for(let dx=-r;dx<=r;dx++){const x=s.x+dx,y=s.y+dy;if(x<0||y<0||x>=N||y>=N)continue;if(Math.hypot(dx,dy)<=r)ctx.fillRect(x*SZ,y*SZ,SZ,SZ);}}});
   // beacons
-  beacons.forEach(b=>{const[x,y]=cellXY(b.cell);drawBeaconArrow(x,y,b.dir,b.owner===role?'orange':'blue');
+  beacons.forEach(b=>{const[x,y]=cellXY(b.cell);drawBeaconArrow(x,y,b.dir,b.owner===role?'orange':'red');
     if(b.owner===role){ctx.fillStyle=b.hit?'rgba(0,255,0,0.25)':'rgba(100,100,100,0.25)';let x0=x,y0=y,x1=b.dir===0||b.dir===3?N:0,y1=b.dir===0||b.dir===1?N:0;if(b.dir===1||b.dir===2)x1=0;else x1=N;if(b.dir===2||b.dir===3)y1=0;else y1=N;const width=(Math.abs(x1-x0))*SZ+SZ,height=(Math.abs(y1-y0))*SZ+SZ;ctx.fillRect(Math.min(x0,x1)*SZ,Math.min(y0,y1)*SZ,width,height);}});
   if(pendingBeacon){const{x,y,dir}=pendingBeacon;drawBeaconArrow(x,y,dir,'white');}
 }
@@ -238,14 +286,14 @@ ctx.canvas.addEventListener('mousedown',e=>{
   const cell=canvasCell(e);if(!cell)return;
   if(pendingBeacon){draggingBeacon=true;pendingBeacon={...pendingBeacon,x:cell.x,y:cell.y,id:cell.id};render();return;}
   if(e.button===0){
-    const idx=ships.indexOf(cell.id);
+    const idx = ships.findIndex(id => distanceId(id, cell.x, cell.y) <= 1);
     if(idx>-1){
       if(radii[idx]===0){dragRad=idx;return;}  // start radius drag immediately
       dragShip=idx;return;
     }
     for(let i=0;i<3;i++){
       const[oX,oY]=cellXY(oldShips[i]);
-      if(Math.abs(Math.hypot(cell.x-oX,cell.y-oY)-radii[i])<=0.3){dragRad=i;return;}
+      if(Math.abs(Math.hypot(cell.x-oX,cell.y-oY)-radii[i])<=0.8){dragRad=i;return;}
     }
   }
 });
@@ -304,13 +352,35 @@ render();
 
 socket.on('enemy_markers',d=>{enemyOld=d.old;enemyRad=d.rad;enemyCr=d.cr;enemyBk=d.bk;circleTog={};d.old.forEach((id,i)=>{circleTog[id]={id,r:d.rad[i],c:d.cr[i],b:d.bk[i],v:true}});render();});
 
-socket.on('result',d=>{const[x,y]=cellXY(d.cell);ctx.fillStyle=d.hit?'orange':'#555';ctx.fillRect(x*SZ+2,y*SZ+2,SZ-4,SZ-4);});
+socket.on('result', d => {
+  const [x, y] = cellXY(d.cell);
 
-socket.on('opponent_guess',d=>{const[x,y]=cellXY(d.cell);ctx.fillStyle='rgba(0,180,255,.4)';ctx.fillRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);});
+  if (d.hit) {
+  playSound('sfxHit');
+  boom(x, y, 'rgba(255,60,0,0.3)', 200);
+} else {
+  playSound('sfxMiss');
+  boom(x, y, 'rgba(0,255,255,0.03)');
+}
+});
+
+
+socket.on('opponent_guess',d=>{
+const[x,y]=cellXY(d.cell);ctx.fillStyle='rgba(0,180,255,.4)';
+ctx.fillRect(x*SZ+1,y*SZ+1,SZ-2,SZ-2);
+if (d.type === 'laser') {
+  const [x,y] = cellXY(d.cell);
+  boom(x, y, 'rgba(80,80,255,0.2)', 150);
+}
+});
 
 socket.on('reset',()=>location.reload());
 
-socket.on('game_over',d=>{gameEnded=true;document.getElementById('overlay').textContent=(d.result==='victory'?'VICTORY!':'DEFEAT');document.getElementById('overlay').style.display='flex';});
+socket.on('game_over',d=>{
+gameEnded=true;
+if (d.result==='defeat') {
+  playSound('sfxDefeat');}
+document.getElementById('overlay').textContent=(d.result==='victory'?'VICTORY!':'DEFEAT');document.getElementById('overlay').style.display='flex';});
 
 socket.on('beacon_ready',d=>{ // server accepted purchase
   pendingBeacon={x:50,y:50,id:toId(50,50),dir:0};document.getElementById('confirmBeacon').style.display='inline';updateUI();render();});
